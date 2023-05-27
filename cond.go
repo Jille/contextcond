@@ -83,7 +83,9 @@ func (c *Cond) Wait() {
 	c.WaitContext(context.Background())
 }
 
-// WaitContext is like wait, but returns a non-nil error iff the context was cancelled.
+// WaitContext is like Wait, but aborts if the given context is cancelled.
+// A non-nil error is returned iff the context was cancelled.
+// The caller should hold c.L, which is dropped and reacquired during WaitContext. When this function returns it always holds c.L.
 func (c *Cond) WaitContext(ctx context.Context) error {
 	c.checks()
 	c.mtxCh <- struct{}{} // lock
