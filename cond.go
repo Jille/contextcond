@@ -10,36 +10,49 @@ import (
 	"unsafe"
 )
 
-// Cond is like sync.Cond with a WaitContext method.
-// The zero value is valid except that L must be set.
+// Cond is like sync.Cond with a WaitContext method. Unlike sync.Cond, Cond must be initialized with NewCond.
 type Cond struct {
 	// L is held while observing or changing the condition
 	L sync.Locker
 
-	// mtx guards ch and waiters.
-	mtx     sync.Mutex
+	// mtxCh acts like a mutex and guards ch and waiters.
+	mtxCh   chan struct{}
 	ch      chan struct{}
 	waiters int
+
+	delegateWaiterLowering chan struct{}
 
 	checker copyChecker
 }
 
 // NewCond returns a new Cond with Locker l.
 func NewCond(l sync.Locker) *Cond {
-	return &Cond{L: l}
+	return &Cond{
+		L:                      l,
+		mtxCh:                  make(chan struct{}, 1),
+		ch:                     make(chan struct{}),
+		delegateWaiterLowering: make(chan struct{}),
+	}
+}
+
+func (c *Cond) checks() {
+	if c.mtxCh == nil {
+		panic("contextcond.Cond must be initialized with NewCond")
+	}
+	c.checker.check()
 }
 
 // Broadcast wakes all goroutines waiting on c.
 //
 // It is allowed but not required for the caller to hold c.L during the call.
 func (c *Cond) Broadcast() {
-	c.checker.check()
-	c.mtx.Lock()
+	c.checks()
+	c.mtxCh <- struct{}{} // lock
 	if c.waiters > 0 {
 		close(c.ch)
-		c.ch = make(chan struct{}, 1)
+		c.ch = make(chan struct{})
 	}
-	c.mtx.Unlock()
+	<-c.mtxCh // unlock
 }
 
 // Signal wakes one goroutine waiting on c, if there is any.
@@ -48,15 +61,20 @@ func (c *Cond) Broadcast() {
 //
 // Signal() does not affect goroutine scheduling priority; if other goroutines are attempting to lock c.L, they may be awoken before a "waiting" goroutine.
 func (c *Cond) Signal() {
-	c.checker.check()
-	c.mtx.Lock()
-	if c.waiters > 0 {
+	c.checks()
+	c.mtxCh <- struct{}{} // lock
+	for c.waiters > 0 {
 		select {
 		case c.ch <- struct{}{}:
-		default:
+			// We awoke a waiter. Let them have the lock so they can lower their waiter count. We don't need it anymore anyway.
+			return
+		case <-c.delegateWaiterLowering:
+			// A waiter was awoken by something other than us. They need to lower c.waiters but can't get the lock because we hold it.
+			// We'll lower the waiter count for them.
+			c.waiters--
 		}
 	}
-	c.mtx.Unlock()
+	<-c.mtxCh // unlock
 }
 
 // Wait atomically unlocks c.L and suspends execution of the calling goroutine. After later resuming execution, Wait locks c.L before returning. Unlike in other systems, Wait cannot return unless awoken by Broadcast or Signal.
@@ -67,34 +85,39 @@ func (c *Cond) Wait() {
 
 // WaitContext is like wait, but returns a non-nil error iff the context was cancelled.
 func (c *Cond) WaitContext(ctx context.Context) error {
-	c.checker.check()
-	c.mtx.Lock()
-	if c.ch == nil {
-		c.ch = make(chan struct{}, 1)
-	}
+	c.checks()
+	c.mtxCh <- struct{}{} // lock
 	ch := c.ch
 	c.waiters++
-	c.mtx.Unlock()
+	<-c.mtxCh // unlock
 
 	c.L.Unlock()
 
 	var err error
+	var signalled bool
 	select {
-	case <-ch:
+	case _, signalled = <-ch:
 		err = nil
 	case <-ctx.Done():
 		err = ctx.Err()
 	}
 
-	c.mtx.Lock()
-	c.waiters--
-	if c.waiters == 0 {
+	// If we were signalled, the Signal() function won't unlock so we now have the lock.
+	loweringDelegated := false
+	if !signalled {
 		select {
-		case <-c.ch:
-		default:
+		case c.mtxCh <- struct{}{}: // lock
+		case c.delegateWaiterLowering <- struct{}{}:
+			// Signal() holds the lock and is kind enough to lower lower c.waiters for us.
+			// We couldn't just grab the lock ourselves, because we might've been the last waiter and Signal() is blocking on writing to c.ch while holding the lock.
+			loweringDelegated = true
 		}
 	}
-	c.mtx.Unlock()
+
+	if !loweringDelegated {
+		c.waiters--
+		<-c.mtxCh // unlock
+	}
 
 	c.L.Lock()
 

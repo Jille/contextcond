@@ -254,10 +254,10 @@ func TestCondCopy(t *testing.T) {
 			t.Fatalf("got %v, expect contextcond.Cond is copied", err)
 		}
 	}()
-	c := contextcond.Cond{L: &sync.Mutex{}}
+	c := contextcond.NewCond(&sync.Mutex{})
 	c.Signal()
 	var c2 contextcond.Cond
-	reflect.ValueOf(&c2).Elem().Set(reflect.ValueOf(&c).Elem()) // c2 := c, hidden from vet
+	reflect.ValueOf(&c2).Elem().Set(reflect.ValueOf(c).Elem()) // c2 := c, hidden from vet
 	c2.Signal()
 }
 
